@@ -3,13 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"github.com/boltdb/bolt"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.org/x/oauth2"
 	"google.golang.org/api/calendar/v3"
 	"google.golang.org/api/option"
+	"log"
 	"sort"
 	"time"
 )
@@ -17,10 +16,52 @@ import (
 type Svc struct {
 	oauthConfig *oauth2.Config
 	database    *bolt.DB
+	options     options
+
+	manualUpdate chan struct{}
+
+	gaugeNextMeetingDuration *prometheus.GaugeVec
+	gaugeNextMeetingEpoch    *prometheus.GaugeVec
+
+	registry *prometheus.Registry
 }
 
-func New(ctx context.Context, oauthConfig *oauth2.Config, db *bolt.DB) *Svc {
-	return &Svc{oauthConfig: oauthConfig, database: db}
+type options struct {
+	host *string
+	port *int
+}
+
+func New(ctx context.Context, opts options, oauthConfig *oauth2.Config, db *bolt.DB) (*Svc, error) {
+	gaugeNextMeetingDuration := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem: "calendar",
+		Name:      "next_meeting_seconds",
+	}, []string{"calendar", "type"})
+	gaugeNextMeetingEpoch := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem: "calendar",
+		Name:      "next_meeting_epoch_seconds",
+	}, []string{"calendar", "type"})
+
+	reg := prometheus.NewRegistry()
+	err := reg.Register(gaugeNextMeetingDuration)
+	if err != nil {
+		return nil, err
+	}
+	err = reg.Register(gaugeNextMeetingEpoch)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Svc{
+		options:      opts,
+		oauthConfig:  oauthConfig,
+		database:     db,
+		manualUpdate: make(chan struct{}, 100),
+
+		gaugeNextMeetingEpoch:    gaugeNextMeetingEpoch,
+		gaugeNextMeetingDuration: gaugeNextMeetingDuration,
+
+		registry: reg,
+	}, nil
 }
 
 func (s *Svc) Cal(ctx context.Context, tokenSource oauth2.TokenSource) (*calendar.Service, error) {
@@ -120,7 +161,7 @@ func (s *Svc) eventsByCalendar(ctx context.Context) (map[string][]Event, error) 
 			TimeMax(time.Now().AddDate(0, 0, 7).Format(time.RFC3339)).
 			Do()
 		if err != nil {
-			fmt.Println("failed to list all events for calendar")
+			log.Printf("[ERROR] failed to list all events for calendar '%s': %v\n", cID, err)
 			return nil
 		}
 
@@ -173,37 +214,45 @@ func (s *Svc) eventsByCalendar(ctx context.Context) (map[string][]Event, error) 
 	return events, err
 }
 
-var (
-	gaugeTimeUntilNextMeeting = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Subsystem: "calendar",
-		Name:      "next_meeting_seconds",
-	}, []string{"calendar", "type"})
-)
-
 func (s *Svc) BackgroundJob(ctx context.Context) {
 	updateTicker := time.NewTicker(10 * time.Minute)
 	recountTicker := time.NewTicker(time.Second)
 
 	events, err := s.eventsByCalendar(ctx)
 	if err != nil {
-		panic(err)
+		log.Fatalf("[FATAL] failed to update events on boot: %v\n", err)
+	} else {
+		log.Printf("successfully updated events\n")
 	}
-	updatePrometheusGauges(events)
+	s.updatePrometheusGauges(events)
 
 	for {
 		select {
+		case <-s.manualUpdate:
+			events, err = s.eventsByCalendar(ctx)
+			if err != nil {
+				log.Printf("[ERROR] failed to update events cache: %v\n", err)
+			} else {
+				log.Printf("manual update successful\n")
+			}
 		case <-updateTicker.C:
 			events, err = s.eventsByCalendar(ctx)
 			if err != nil {
-				fmt.Println("failed to update events cache: %w", err)
+				log.Printf("[ERROR] failed to update events cache: %v\n", err)
+			} else {
+				log.Printf("timed update successful\n")
 			}
 		case <-recountTicker.C:
-			updatePrometheusGauges(events)
+			s.updatePrometheusGauges(events)
+		case <-ctx.Done():
+			updateTicker.Stop()
+			recountTicker.Stop()
+			return
 		}
 	}
 }
 
-func updatePrometheusGauges(calendarEvents map[string][]Event) {
+func (s *Svc) updatePrometheusGauges(calendarEvents map[string][]Event) {
 	for cal, events := range calendarEvents {
 		var updatedMeeting bool
 		var updatedFocusTime bool
@@ -232,17 +281,20 @@ func updatePrometheusGauges(calendarEvents map[string][]Event) {
 				kind = focusTime
 			}
 
-			gaugeTimeUntilNextMeeting.WithLabelValues(cal, kind).Set(durationTilStart)
+			s.gaugeNextMeetingDuration.WithLabelValues(cal, kind).Set(durationTilStart)
+			s.gaugeNextMeetingEpoch.WithLabelValues(cal, kind).Set(float64(event.Starts.Unix()))
 			if updatedMeeting && updatedFocusTime {
 				break
 			}
 		}
 
 		if !updatedMeeting {
-			gaugeTimeUntilNextMeeting.DeleteLabelValues(cal, meeting)
+			s.gaugeNextMeetingDuration.DeleteLabelValues(cal, meeting)
+			s.gaugeNextMeetingEpoch.DeleteLabelValues(cal, meeting)
 		}
 		if !updatedFocusTime {
-			gaugeTimeUntilNextMeeting.DeleteLabelValues(cal, focusTime)
+			s.gaugeNextMeetingDuration.DeleteLabelValues(cal, focusTime)
+			s.gaugeNextMeetingEpoch.DeleteLabelValues(cal, focusTime)
 		}
 	}
 }
